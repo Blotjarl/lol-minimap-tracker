@@ -1,0 +1,6 @@
+Minimap ROI selected:
+x_min = 926
+y_min = 364
+x_max = 1266
+y_max = 705
+Press any key to close.
