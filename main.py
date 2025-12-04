@@ -11,14 +11,37 @@ OUTPUT_CSV = "output/tracks.csv"
 # From ROI selection script
 MINIMAP_ROI = (926, 364, 1266, 705)  # (x_min, y_min, x_max, y_max)
 
-# Thresholds / params
-DIFF_THRESH = 25          # for frame differencing (0-255)
-MIN_BLOB_AREA = 20        # min area for a blob to be considered (pixels)
+MIN_BLOB_AREA = 20          # min area for a blob to be considered (pixels)
+MAX_TRACK_DIST = 25         # max distance (in pixels) to associate a detection to an existing track
 
-# HSV ranges for player blue icon (you may need to tweak these)
-# These are generic blue ranges – we might refine later if needed.
-LOWER_BLUE = (100, 80, 80)
-UPPER_BLUE = (130, 255, 255)
+# HSV ranges for team colors (you can tweak these if needed)
+# Blue team icons
+LOWER_BLUE = np.array([90, 50, 50])
+UPPER_BLUE = np.array([140, 255, 255])
+
+# Red team icons (wrapped around hue 0)
+LOWER_RED1 = np.array([0, 70, 50])
+UPPER_RED1 = np.array([10, 255, 255])
+LOWER_RED2 = np.array([170, 70, 50])
+UPPER_RED2 = np.array([180, 255, 255])
+
+
+def get_centroids_from_mask(mask, min_area, color_label):
+    """Return a list of detections: dicts with x, y, color."""
+    detections = []
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask)
+
+    for label in range(1, num_labels):  # 0 is background
+        area = stats[label, cv2.CC_STAT_AREA]
+        if area < min_area:
+            continue
+        cx, cy = centroids[label]
+        detections.append({
+            "x": int(cx),
+            "y": int(cy),
+            "color": color_label,
+        })
+    return detections
 
 
 def main():
@@ -48,12 +71,13 @@ def main():
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     out = cv2.VideoWriter(OUTPUT_MINIMAP_VIDEO, fourcc, fps, (width, height))
 
-    # For frame differencing
-    prev_gray_minimap = None
+    # ---- Multi-object tracks ----
+    # Each track: {"id": int, "color": "blue"/"red", "last_pos": (x, y), "points": [(x, y), ...]}
+    tracks = []
+    next_track_id = 0
 
-    # For storing track info
-    player_points = []  # list of (x, y) tuples in minimap coords
-    track_rows = []     # rows for CSV: frame_index, time_seconds, track_id, x, y
+    # For CSV logging
+    track_rows = []
 
     frame_idx = 0
 
@@ -65,82 +89,96 @@ def main():
         # ---- Crop minimap ----
         minimap = frame[y_min:y_max, x_min:x_max]
 
-        # ---- Convert to grayscale for frame differencing ----
-        gray = cv2.cvtColor(minimap, cv2.COLOR_BGR2GRAY)
-
-        if prev_gray_minimap is None:
-            prev_gray_minimap = gray
-            # we still write the frame but we cannot compute motion yet
-            out.write(minimap)
-            frame_idx += 1
-            continue
-
-        # ---- Frame differencing ----
-        diff = cv2.absdiff(gray, prev_gray_minimap)
-        _, diff_thresh = cv2.threshold(diff, DIFF_THRESH, 255, cv2.THRESH_BINARY)
-
-        # update previous frame
-        prev_gray_minimap = gray
-
-        # ---- Color thresholding in HSV for blue icon ----
+        # ---- HSV color thresholding ----
         hsv = cv2.cvtColor(minimap, cv2.COLOR_BGR2HSV)
+
+        # Blue team
         mask_blue = cv2.inRange(hsv, LOWER_BLUE, UPPER_BLUE)
 
-        # ---- Combine motion + color ----
-        moving_blue = cv2.bitwise_and(mask_blue, diff_thresh)
+        # Red team (two ranges merged)
+        mask_red1 = cv2.inRange(hsv, LOWER_RED1, UPPER_RED1)
+        mask_red2 = cv2.inRange(hsv, LOWER_RED2, UPPER_RED2)
+        mask_red = cv2.bitwise_or(mask_red1, mask_red2)
 
         # ---- Morphological cleanup ----
         kernel = np.ones((3, 3), np.uint8)
-        moving_blue_clean = cv2.morphologyEx(moving_blue, cv2.MORPH_OPEN, kernel)
+        mask_blue_clean = cv2.morphologyEx(mask_blue, cv2.MORPH_OPEN, kernel)
+        mask_red_clean = cv2.morphologyEx(mask_red, cv2.MORPH_OPEN, kernel)
 
-        # ---- Connected components to find blobs ----
-        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(moving_blue_clean)
+        # ---- Get detections for this frame ----
+        detections = []
+        detections.extend(get_centroids_from_mask(mask_blue_clean, MIN_BLOB_AREA, "blue"))
+        detections.extend(get_centroids_from_mask(mask_red_clean, MIN_BLOB_AREA, "red"))
 
-        player_centroid = None
+        # ---- Associate detections to existing tracks (greedy nearest-neighbor per color) ----
+        for det in detections:
+            dx_best = None
+            best_track = None
+            det_x, det_y, det_color = det["x"], det["y"], det["color"]
 
-        # label 0 is background; start at 1
-        best_area = 0
-        for label in range(1, num_labels):
-            area = stats[label, cv2.CC_STAT_AREA]
-            if area < MIN_BLOB_AREA:
-                continue
+            for track in tracks:
+                if track["color"] != det_color:
+                    continue
+                last_x, last_y = track["last_pos"]
+                dx = det_x - last_x
+                dy = det_y - last_y
+                dist2 = dx * dx + dy * dy
 
-            cx, cy = centroids[label]
-            # choose largest blob as player (simple heuristic)
-            if area > best_area:
-                best_area = area
-                player_centroid = (int(cx), int(cy))
+                if dist2 <= MAX_TRACK_DIST * MAX_TRACK_DIST:
+                    if dx_best is None or dist2 < dx_best:
+                        dx_best = dist2
+                        best_track = track
 
-        # ---- Save track data if we found the player ----
-        if player_centroid is not None:
-            player_points.append(player_centroid)
+            if best_track is None:
+                # Start a new track
+                track = {
+                    "id": next_track_id,
+                    "color": det_color,
+                    "last_pos": (det_x, det_y),
+                    "points": [(det_x, det_y)],
+                }
+                tracks.append(track)
+                track_id = next_track_id
+                next_track_id += 1
+            else:
+                # Append to existing track
+                best_track["last_pos"] = (det_x, det_y)
+                best_track["points"].append((det_x, det_y))
+                track_id = best_track["id"]
+
+            # Log to CSV
             time_seconds = frame_idx / fps if fps > 0 else 0.0
-
             track_rows.append({
                 "frame_index": frame_idx,
                 "time_seconds": time_seconds,
-                "track_id": "player",
-                "x": player_centroid[0],
-                "y": player_centroid[1],
+                "track_id": track_id,
+                "team_color": det_color,
+                "x": det_x,
+                "y": det_y,
             })
 
-        # ---- Draw trajectory on minimap ----
-        # Draw all previous points as a path
-        for i in range(1, len(player_points)):
-            cv2.line(
-                minimap,
-                player_points[i - 1],
-                player_points[i],
-                (255, 255, 255),  # white line for path
-                2,
-                cv2.LINE_AA,
-            )
+        # ---- Draw all tracks on minimap ----
+        for track in tracks:
+            pts = track["points"]
+            if len(pts) < 2:
+                continue
 
-        # Draw current position as small circle
-        if player_centroid is not None:
-            cv2.circle(minimap, player_centroid, 4, (0, 255, 255), -1)  # yellow dot
+            # Choose color by team
+            if track["color"] == "blue":
+                line_color = (200, 200, 255)  # light bluish-white
+            else:
+                line_color = (50, 180, 255)   # orange-ish for red team
 
-        # Optional: overlay frame index
+            for i in range(1, len(pts)):
+                cv2.line(
+                    minimap,
+                    pts[i - 1],
+                    pts[i],
+                    line_color,
+                    2,
+                    cv2.LINE_AA,
+                )
+
         cv2.putText(
             minimap,
             f"Frame: {frame_idx}",
@@ -152,10 +190,9 @@ def main():
             cv2.LINE_AA,
         )
 
-        # ---- Write minimap frame with drawn path ----
         out.write(minimap)
 
-        # Optional: live preview
+        # Optional live preview
         cv2.imshow("Minimap Tracked", minimap)
         if cv2.waitKey(1) & 0xFF == ord("q"):
             break
@@ -169,13 +206,24 @@ def main():
     # ---- Write CSV with tracks ----
     if track_rows:
         with open(OUTPUT_CSV, "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=["frame_index", "time_seconds", "track_id", "x", "y"])
+            writer = csv.DictWriter(
+                f,
+                fieldnames=[
+                    "frame_index",
+                    "time_seconds",
+                    "track_id",
+                    "team_color",
+                    "x",
+                    "y",
+                ],
+            )
             writer.writeheader()
             for row in track_rows:
                 writer.writerow(row)
+
         print(f"[DONE] Saved tracks to {OUTPUT_CSV}")
     else:
-        print("[WARN] No player tracks found; CSV not written.")
+        print("[WARN] No tracks found; CSV not written.")
 
     print(f"[DONE] Saved tracked minimap video to {OUTPUT_MINIMAP_VIDEO}")
 
